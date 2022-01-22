@@ -41,23 +41,25 @@ func (l) Logf(format string, args ...interface{}) {
 }
 
 func main() {
-	run()
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func run() {
+func run() error {
 	// Create an etcd server.
 	cfg := embed.NewConfig()
 	cfg.Dir = "default.etcd" // TODO: make unique per invocation
 	e, err := embed.StartEtcd(cfg)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("start etcd: %w", err)
 	}
 	defer e.Close()
 	select {
 	case <-e.Server.ReadyNotify():
 	case <-time.After(60 * time.Second):
 		e.Server.Stop() // trigger a shutdown
-		log.Fatal("etcd server took too long to start")
+		return errors.New("etcd server took too long to start")
 	}
 	var etcdURL string
 	for _, u := range cfg.ACUrls {
@@ -67,7 +69,7 @@ func run() {
 		}
 	}
 	if etcdURL == "" {
-		log.Fatal("no etcd URL?")
+		return errors.New("no etcd URL?")
 	}
 
 	// Shut up k8s warnings.
@@ -89,7 +91,7 @@ func run() {
 	opts := apiservertesting.NewDefaultTestServerOptions()
 	api, err := apiservertesting.StartTestServer(l{}, opts, nil, storageConfig)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("start kube-apiserer: %w", err)
 	}
 	defer api.TearDownFn()
 	log.Printf("** kube-apiserver listening on %v", api.ClientConfig.Host)
@@ -97,7 +99,7 @@ func run() {
 	// Write a kubeconfig file to /tmp.
 	kubeconfigFD, err := os.CreateTemp("", "test-apiserver-kubeconfig-*")
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("create file for kubeconfig: %w", err)
 	}
 	kubeconfigFD.Close()
 	defer os.Remove(kubeconfigFD.Name())
@@ -127,12 +129,12 @@ func run() {
 		},
 	}
 	if err := clientcmd.WriteToFile(kubeconfig, kubeconfigFD.Name()); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("write kubeconfig file: %w", err)
 	}
 
 	// Link this kubeconfig to /tmp/kubeconfig for easy CLI manipulation when only one is running.
-	os.Remove("/tmp/kubeconfig")
-	os.Symlink(kubeconfigFD.Name(), "/tmp/kubeconfig")
+	os.Remove("/tmp/kubeconfig")                       // nolint: errcheck
+	os.Symlink(kubeconfigFD.Name(), "/tmp/kubeconfig") // nolint: errcheck
 	log.Printf("** kubeconfig at %v\n", kubeconfigFD.Name())
 
 	// Create a kube-controller-manager.
@@ -140,14 +142,14 @@ func run() {
 		fmt.Sprintf("--kubeconfig=%s", kubeconfigFD.Name()),
 	})
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("start kube-controller-manager: %w", err)
 	}
 	defer ctrlmgr.TearDownFn()
 
 	// Connect to the apiserver.
 	k8s, err := kubernetes.NewForConfig(api.ClientConfig)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("create clientset connected to the apiserver: %w", err)
 	}
 
 	// Run our mini-kubelet.
@@ -165,8 +167,6 @@ func run() {
 						return errors.New("killed")
 					}
 				}
-				log.Printf("**** busybox on %v exiting", pod.Name)
-				return nil
 			},
 		},
 	}
@@ -187,11 +187,11 @@ func run() {
 	select {
 	case <-pmDone:
 		log.Printf("pod manager exited; shutting down")
-		return
+		return nil
 	case <-intCh:
 		log.Printf("interrupt; shutting down")
 		signal.Stop(intCh)
-		return
+		return nil
 	}
 }
 

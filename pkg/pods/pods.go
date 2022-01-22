@@ -11,7 +11,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -140,7 +139,7 @@ func diffPods(a, b *corev1.Pod) ([]byte, error) {
 	if err := encoder.Encode(b, bData); err != nil {
 		return nil, fmt.Errorf("marshal new pod: %w", err)
 	}
-	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(aData.Bytes(), bData.Bytes(), &v1.Pod{})
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(aData.Bytes(), bData.Bytes(), &corev1.Pod{})
 	if err != nil {
 		return nil, fmt.Errorf("create two-way merge patch: %w", err)
 	}
@@ -174,14 +173,20 @@ func (m *Manager) Run(ctx context.Context, namespace string) error {
 	inf := informers.NewSharedInformerFactoryWithOptions(m.K8s, time.Hour, informers.WithNamespace(namespace)).Core().V1().Pods().Informer()
 	inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			pod := obj.(*v1.Pod)
+			pod, ok := obj.(*corev1.Pod)
+			if !ok {
+				return
+			}
+
 			if pod.Spec.NodeName != "" && pod.Spec.NodeName != m.NodeName {
 				return
 			}
+
 			if _, ok := m.runningPods[pod.Name]; ok {
 				m.L.Printf("got an 'Added' event for already-running pod %v", pod.Name)
 				return
 			}
+
 			// The most correct implemenation would check for a PodScheduled condition, ensure
 			// that we are the node that is supposed to run it, and then start it.  Right now,
 			// we combine scheduling and starting.
@@ -193,16 +198,21 @@ func (m *Manager) Run(ctx context.Context, namespace string) error {
 			m.runningPods[pod.Name] = ch
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			pod := newObj.(*v1.Pod)
+			pod, ok := newObj.(*corev1.Pod)
+			if !ok {
+				return
+			}
+
+			if pod.Spec.NodeName != m.NodeName {
+				return
+			}
+
 			patchBytes, err := diffPods(oldObj.(*corev1.Pod), newObj.(*corev1.Pod))
 			if err != nil {
 				patchBytes = []byte(fmt.Sprintf("problem diffing pods: %v", err))
 			}
 			m.L.Printf("pod %s update: %s", pod.Name, patchBytes)
 
-			if pod.Spec.NodeName != m.NodeName {
-				return
-			}
 			c, ok := m.runningPods[pod.Name]
 			if !ok {
 				m.L.Printf("receivied modification event for unknown pod %v", pod.Name)
@@ -217,10 +227,15 @@ func (m *Manager) Run(ctx context.Context, namespace string) error {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			pod := obj.(*v1.Pod)
+			pod, ok := obj.(*corev1.Pod)
+			if !ok {
+				return
+			}
+
 			if pod.Spec.NodeName != m.NodeName {
 				return
 			}
+
 			if _, ok := m.runningPods[pod.Name]; ok {
 				// Deletion through the API happens by setting the DeletionTimestamp.  We
 				// remove it from runningPods at deletion request time, rather than here, so
@@ -271,7 +286,7 @@ func (m *Manager) runPod(ctx context.Context, pod *corev1.Pod) (chan<- struct{},
 	for _, c := range pod.Spec.Containers {
 		m.L.Printf("pod %v: container %v: attempting to start", pod.Name, c.Name)
 		pod.Status.ContainerStatuses = append(pod.Status.ContainerStatuses, corev1.ContainerStatus{Name: c.Name})
-		status := &pod.Status.ContainerStatuses[len(pod.Status.ContainerStatuses)-1]
+		st := &pod.Status.ContainerStatuses[len(pod.Status.ContainerStatuses)-1]
 
 		// See if there is code we can run to implement this container.
 		code, ok := m.UserCode[c.Image]
@@ -279,7 +294,7 @@ func (m *Manager) runPod(ctx context.Context, pod *corev1.Pod) (chan<- struct{},
 			// No code to run, pretend that there's a problem pulling the
 			// container.
 			m.L.Printf("pod %v: container %v: no UserCode to run", pod.Name, c.Name)
-			status.State.Terminated = &corev1.ContainerStateTerminated{
+			st.State.Terminated = &corev1.ContainerStateTerminated{
 				Reason:  fmt.Sprintf("No entry in the UserCode map for image %q", c.Image),
 				Message: fmt.Sprintf("No entry in the UserCode map for image %q", c.Image),
 			}
@@ -287,11 +302,11 @@ func (m *Manager) runPod(ctx context.Context, pod *corev1.Pod) (chan<- struct{},
 		}
 
 		// Container pulled, update the status and run it.
-		status.State.Running = &corev1.ContainerStateRunning{
+		st.State.Running = &corev1.ContainerStateRunning{
 			StartedAt: metav1.Now(),
 		}
-		status.Started = pointer.Bool(true)
-		status.Ready = true
+		st.Started = pointer.Bool(true)
+		st.Ready = true
 		runningContainers++
 		go func(p *corev1.Pod, c corev1.Container) {
 			m.L.Printf("pod %v: container %v: starting", p.Name, c.Name)
@@ -369,7 +384,7 @@ func (m *Manager) runPod(ctx context.Context, pod *corev1.Pod) (chan<- struct{},
 						st.Ready = false
 						st.Started = pointer.Bool(false)
 						st.State.Running = nil
-						st.State.Terminated = &v1.ContainerStateTerminated{
+						st.State.Terminated = &corev1.ContainerStateTerminated{
 							ExitCode:   exitCode,
 							Reason:     reason,
 							FinishedAt: end,
@@ -426,6 +441,7 @@ func (m *Manager) runPod(ctx context.Context, pod *corev1.Pod) (chan<- struct{},
 				c.Reason = status.PodCompleted
 				c.LastTransitionTime = metav1.Now()
 				c.Message = ""
+			case corev1.PodInitialized, corev1.PodScheduled:
 			}
 		}
 
@@ -436,7 +452,6 @@ func (m *Manager) runPod(ctx context.Context, pod *corev1.Pod) (chan<- struct{},
 		}
 
 		m.L.Printf("pod %v: ending loop", pod.Name)
-		return
 	}()
 	return closeCh, nil
 }

@@ -1,0 +1,55 @@
+run:
+    modules-download-mode: readonly
+linters-settings:
+    gofmt:
+        simplify: true
+    errcheck:
+        check-type-assertions: true
+        check-blank: true
+        ignore: fmt:.*,io/ioutil:^Read.*
+    exhaustive:
+        default-signifies-exhaustive: true
+    nolintlint:
+        allow-unused: true
+    gocritic:
+        enabled-tags:
+            - diagnostic
+            - experimental
+            - opinionated
+            - style
+        disabled-checks:
+            - whyNoLint
+linters:
+    enable:
+        - asciicheck
+        - bodyclose
+        - deadcode
+        - dogsled
+        - dupl
+        - errcheck
+        - exhaustive
+        - exportloopref
+        - gocritic
+        - gofmt
+        - goprintffuncname
+        - gosec
+        - gosimple
+        - govet
+        - ineffassign
+        - megacheck
+        - misspell
+        - nakedret
+        - noctx
+        - prealloc
+        - rowserrcheck
+        - sqlclosecheck
+        - staticcheck
+        - structcheck
+        - stylecheck
+        - typecheck
+        - unparam
+        - unused
+        - varcheck
+        - whitespace
+    disable-all: true
+    fast: false
