@@ -2,44 +2,52 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pachyderm/fakeapiserver/pkg/pods"
 	"go.etcd.io/etcd/server/v3/embed"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	"k8s.io/client-go/kubernetes"
-	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
-
-	cmtesting "k8s.io/kubernetes/cmd/kube-controller-manager/app/testing"
-
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientapi "k8s.io/client-go/tools/clientcmd/api"
+	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	cmtesting "k8s.io/kubernetes/cmd/kube-controller-manager/app/testing"
 	"k8s.io/utils/pointer"
 )
 
 type l struct {
 }
 
-func (l) Errorf(format string, args ...any) {
+func (l) Errorf(format string, args ...interface{}) {
 	log.Printf(format, args...)
 }
-func (l) Fatalf(format string, args ...any) {
+func (l) Fatalf(format string, args ...interface{}) {
 	log.Fatalf(format, args...)
 }
-func (l) Logf(format string, args ...any) {
+func (l) Logf(format string, args ...interface{}) {
 	log.Printf(format, args...)
 }
 
 func main() {
+	run()
+}
+
+func run() {
+	// Create an etcd server.
 	cfg := embed.NewConfig()
-	cfg.Dir = "default.etcd"
+	cfg.Dir = "default.etcd" // TODO: make unique per invocation
 	e, err := embed.StartEtcd(cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -47,10 +55,9 @@ func main() {
 	defer e.Close()
 	select {
 	case <-e.Server.ReadyNotify():
-		log.Printf("Server is ready!")
 	case <-time.After(60 * time.Second):
 		e.Server.Stop() // trigger a shutdown
-		log.Printf("Server took too long to start!")
+		log.Fatal("etcd server took too long to start")
 	}
 	var etcdURL string
 	for _, u := range cfg.ACUrls {
@@ -59,7 +66,22 @@ func main() {
 			break
 		}
 	}
+	if etcdURL == "" {
+		log.Fatal("no etcd URL?")
+	}
 
+	// Shut up k8s warnings.
+	rest.SetDefaultWarningHandler(
+		rest.NewWarningWriter(os.Stderr, rest.WarningWriterOptions{
+			// only print a given warning the first time we receive it
+			Deduplicate: true,
+			// highlight the output with color when the output supports it
+			Color: false,
+		},
+		),
+	)
+
+	// Create an apiserver pointed at the etcd we just created.
 	storageConfig := storagebackend.NewDefaultConfig(path.Join(uuid.New().String(), "registry"), nil)
 	storageConfig.Transport.ServerList = []string{etcdURL}
 	storageConfig.Transport.CertFile = cfg.ClientTLSInfo.CertFile
@@ -69,9 +91,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("** kube-apiserver listening on %v\n", api.ClientConfig.Host)
 	defer api.TearDownFn()
+	log.Printf("** kube-apiserver listening on %v", api.ClientConfig.Host)
 
+	// Write a kubeconfig file to /tmp.
 	kubeconfigFD, err := os.CreateTemp("", "test-apiserver-kubeconfig-*")
 	if err != nil {
 		log.Fatal(err)
@@ -103,13 +126,16 @@ func main() {
 			},
 		},
 	}
-	fmt.Printf("%#v\n", api.ClientConfig)
-	fmt.Printf("%#v\n", kubeconfig)
 	if err := clientcmd.WriteToFile(kubeconfig, kubeconfigFD.Name()); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("kubeconfig at %v\n", kubeconfigFD.Name())
 
+	// Link this kubeconfig to /tmp/kubeconfig for easy CLI manipulation when only one is running.
+	os.Remove("/tmp/kubeconfig")
+	os.Symlink(kubeconfigFD.Name(), "/tmp/kubeconfig")
+	log.Printf("** kubeconfig at %v\n", kubeconfigFD.Name())
+
+	// Create a kube-controller-manager.
 	ctrlmgr, err := cmtesting.StartTestServer(l{}, []string{
 		fmt.Sprintf("--kubeconfig=%s", kubeconfigFD.Name()),
 	})
@@ -118,41 +144,80 @@ func main() {
 	}
 	defer ctrlmgr.TearDownFn()
 
+	// Connect to the apiserver.
 	k8s, err := kubernetes.NewForConfig(api.ClientConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Run our mini-kubelet.
+	pmDone := make(chan struct{})
+	pm := pods.Manager{
+		K8s: k8s,
+		UserCode: map[string]pods.UserCode{
+			"busybox": func(pod *corev1.Pod, container *corev1.Container, stopCh <-chan struct{}) error {
+				for i := 0; ; i++ {
+					select {
+					case <-time.After(time.Second):
+						log.Printf("**** this is busybox on %v, iteration %d", pod.Name, i)
+					case <-stopCh:
+						log.Printf("**** busybox on %v killed", pod.Name)
+						return errors.New("killed")
+					}
+				}
+				log.Printf("**** busybox on %v exiting", pod.Name)
+				return nil
+			},
+		},
+	}
+	go func() {
+		defer close(pmDone)
+		if err := pm.Run(context.Background(), "default"); err != nil {
+			log.Fatalf("pod manager died: %v", err)
+		}
+	}()
+
+	// Add an RC.
 	applyRCAndWatch(k8s)
+
+	intCh := make(chan os.Signal, 1)
+	signal.Notify(intCh, os.Interrupt)
+
+	// Block.
+	select {
+	case <-pmDone:
+		log.Printf("pod manager exited; shutting down")
+		return
+	case <-intCh:
+		log.Printf("interrupt; shutting down")
+		signal.Stop(intCh)
+		return
+	}
 }
 
 func applyRCAndWatch(k8s *kubernetes.Clientset) {
-	{
-		podWatch, err := k8s.CoreV1().Pods("default").Watch(context.TODO(), v1.ListOptions{
-			Watch: true,
-		})
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer podWatch.Stop()
-		go func() {
-			for result := range podWatch.ResultChan() {
-				fmt.Printf("pod: %#v\n", result)
-			}
-		}()
+	if _, err := k8s.CoreV1().Services("default").Create(context.TODO(), &corev1.Service{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "test-rc",
+			Namespace: "default",
+		},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: "None",
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "foo",
+					Protocol:   corev1.ProtocolTCP,
+					Port:       1234,
+					TargetPort: intstr.FromInt(1234),
+				},
+			},
+			Selector: map[string]string{"app": "test"},
+		},
+	}, v1.CreateOptions{}); err != nil {
+		panic(err)
 	}
-	{
-		rcWatch, err := k8s.CoreV1().ReplicationControllers("default").Watch(context.TODO(), v1.ListOptions{Watch: true})
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer rcWatch.Stop()
-		go func() {
-			for result := range rcWatch.ResultChan() {
-				fmt.Printf("rc: %#v\n", result)
-			}
-		}()
-	}
-	k8s.CoreV1().ReplicationControllers("default").Create(context.TODO(), &corev1.ReplicationController{
+	if _, err := k8s.CoreV1().ReplicationControllers("default").Create(context.TODO(), &corev1.ReplicationController{
 		ObjectMeta: v1.ObjectMeta{
 			Name:      "test-rc",
 			Namespace: "default",
@@ -170,11 +235,18 @@ func applyRCAndWatch(k8s *kubernetes.Clientset) {
 							Name:    "busybox",
 							Image:   "busybox",
 							Command: []string{"sleep", "infinity"},
+							Ports: []corev1.ContainerPort{
+								{
+									Name:          "foo",
+									ContainerPort: 1234,
+								},
+							},
 						},
 					},
 				},
 			},
 		},
-	}, v1.CreateOptions{})
-	select {}
+	}, v1.CreateOptions{}); err != nil {
+		panic(err)
+	}
 }
